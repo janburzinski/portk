@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -18,59 +19,122 @@ import (
 var (
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#FF6B6B")).
-			MarginBottom(1)
+			Foreground(lipgloss.Color("#FF6B6B"))
 
-	headerStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("#666666"))
+	countStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#5C6370"))
 
 	portStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#61AFEF")).
 			Bold(true)
 
-	portSystemStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#E5C07B")).
+	commandStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#C678DD")).
 			Bold(true)
 
-	commandStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#C678DD"))
-
 	pidStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#666666"))
-
-	userStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#666666"))
+			Foreground(lipgloss.Color("#5C6370"))
 
 	cursorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FF6B6B")).
 			Bold(true)
 
-	selectedRowStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color("#2C313A")).
-				Bold(true)
+	rowStyle = lipgloss.NewStyle()
+
+	selectedRowBg = lipgloss.NewStyle().
+			Background(lipgloss.Color("#2C313A"))
 
 	confirmStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#E06C75")).
-			MarginTop(1)
+			Foreground(lipgloss.Color("#E5C07B"))
 
 	successStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#98C379")).
-			MarginTop(1)
+			Foreground(lipgloss.Color("#98C379"))
 
-	errorStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#E06C75")).
-			MarginTop(1)
+	errorMsgStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#E06C75"))
 
 	helpStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#5C6370")).
-			MarginTop(1)
+			Foreground(lipgloss.Color("#5C6370"))
 
 	emptyStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#5C6370")).
 			Italic(true)
+
+	separatorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#3E4451"))
+
+	flagAllStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#5C6370"))
 )
+
+// --- Dev process detection ---
+
+// Processes that are almost certainly dev servers
+var devCommands = map[string]bool{
+	"node":       true,
+	"bun":        true,
+	"deno":       true,
+	"tsx":        true,
+	"ts-node":    true,
+	"npx":        true,
+	"next-serve": true,
+	"vite":       true,
+	"esbuild":    true,
+	"python":     true,
+	"python3":    true,
+	"uvicorn":    true,
+	"gunicorn":   true,
+	"flask":      true,
+	"django":     true,
+	"ruby":       true,
+	"rails":      true,
+	"puma":       true,
+	"go":         true,
+	"air":        true,
+	"cargo":      true,
+	"java":       true,
+	"gradle":     true,
+	"mvn":        true,
+	"php":        true,
+	"artisan":    true,
+	"nginx":      true,
+	"caddy":      true,
+	"hugo":       true,
+	"jekyll":     true,
+	"webpack":    true,
+	"parcel":     true,
+	"turbo":      true,
+	"wrangler":   true,
+	"miniflare":  true,
+	"workerd":    true,
+	"handler":    true,
+	"doppler":    true,
+	"docker-pro": true,
+	"com.docke":  true,
+	"redis-ser":  true,
+	"postgres":   true,
+	"mysqld":     true,
+	"mongod":     true,
+	"beam.smp":   true, // Elixir/Erlang
+	"mix":        true,
+	"iex":        true,
+	"elixir":     true,
+}
+
+func isDevProcess(command string) bool {
+	cmd := strings.ToLower(command)
+	if devCommands[cmd] {
+		return true
+	}
+	// Partial matches for truncated names
+	for prefix := range devCommands {
+		if strings.HasPrefix(cmd, prefix) {
+			return true
+		}
+	}
+	return false
+}
 
 // --- Port scanning ---
 
@@ -81,7 +145,7 @@ type PortInfo struct {
 	User    string
 }
 
-func getPorts() []PortInfo {
+func getPorts(showAll bool) []PortInfo {
 	cmd := exec.Command("lsof", "-iTCP", "-sTCP:LISTEN", "-nP")
 	out, err := cmd.Output()
 	if err != nil {
@@ -118,6 +182,10 @@ func getPorts() []PortInfo {
 		}
 		seen[port] = true
 
+		if !showAll && !isDevProcess(command) {
+			continue
+		}
+
 		ports = append(ports, PortInfo{
 			Port:    port,
 			PID:     pid,
@@ -126,15 +194,20 @@ func getPorts() []PortInfo {
 		})
 	}
 
+	// Sort by port number for readability
+	sort.Slice(ports, func(i, j int) bool {
+		return ports[i].Port < ports[j].Port
+	})
+
 	return ports
 }
 
 // --- TUI Model ---
 
-type state int
+type viewState int
 
 const (
-	stateList state = iota
+	stateList viewState = iota
 	stateConfirm
 	stateResult
 )
@@ -142,8 +215,9 @@ const (
 type model struct {
 	ports      []PortInfo
 	cursor     int
-	state      state
+	state      viewState
 	forceKill  bool
+	showAll    bool
 	message    string
 	messageErr bool
 	width      int
@@ -152,7 +226,7 @@ type model struct {
 
 func initialModel() model {
 	return model{
-		ports: getPorts(),
+		ports: getPorts(false),
 		state: stateList,
 	}
 }
@@ -161,8 +235,8 @@ type portsRefreshedMsg struct {
 	ports []PortInfo
 }
 
-func refreshPorts() tea.Msg {
-	return portsRefreshedMsg{ports: getPorts()}
+func (m model) refreshPorts() tea.Msg {
+	return portsRefreshedMsg{ports: getPorts(m.showAll)}
 }
 
 func (m model) Init() tea.Cmd {
@@ -191,9 +265,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 
-	// Global keys
 	switch key {
-	case "ctrl+c", "q":
+	case "ctrl+c":
+		return m, tea.Quit
+	case "q":
 		if m.state == stateConfirm {
 			m.state = stateList
 			m.forceKill = false
@@ -223,36 +298,37 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleListKey(key string) (tea.Model, tea.Cmd) {
-	if len(m.ports) == 0 {
-		if key == "r" {
-			return m, refreshPorts
-		}
-		return m, nil
-	}
-
 	switch key {
 	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--
 		}
 	case "down", "j":
-		if m.cursor < len(m.ports)-1 {
+		if len(m.ports) > 0 && m.cursor < len(m.ports)-1 {
 			m.cursor++
 		}
 	case "home", "g":
 		m.cursor = 0
 	case "end", "G":
-		m.cursor = len(m.ports) - 1
-	case "K":
-		// Force kill — confirm with SIGKILL
-		m.state = stateConfirm
-		m.forceKill = true
+		if len(m.ports) > 0 {
+			m.cursor = len(m.ports) - 1
+		}
 	case "enter":
-		// Kill — confirm with SIGTERM
-		m.state = stateConfirm
-		m.forceKill = false
+		if len(m.ports) > 0 {
+			m.state = stateConfirm
+			m.forceKill = false
+		}
+	case "K":
+		if len(m.ports) > 0 {
+			m.state = stateConfirm
+			m.forceKill = true
+		}
+	case "a":
+		m.showAll = !m.showAll
+		m.cursor = 0
+		return m, m.refreshPorts
 	case "r":
-		return m, refreshPorts
+		return m, m.refreshPorts
 	}
 
 	return m, nil
@@ -261,6 +337,10 @@ func (m model) handleListKey(key string) (tea.Model, tea.Cmd) {
 func (m model) handleConfirmKey(key string) (tea.Model, tea.Cmd) {
 	switch key {
 	case "y", "enter":
+		if m.cursor >= len(m.ports) {
+			m.state = stateList
+			return m, nil
+		}
 		p := m.ports[m.cursor]
 		sig := syscall.SIGTERM
 		sigName := "SIGTERM"
@@ -274,14 +354,14 @@ func (m model) handleConfirmKey(key string) (tea.Model, tea.Cmd) {
 			m.message = fmt.Sprintf("Failed to kill PID %d: %s", p.PID, err)
 			m.messageErr = true
 		} else {
-			m.message = fmt.Sprintf("Killed :%d (%s, PID %d) [%s]", p.Port, p.Command, p.PID, sigName)
+			m.message = fmt.Sprintf("Killed :%d  %s (PID %d) [%s]", p.Port, p.Command, p.PID, sigName)
 			m.messageErr = false
 		}
 		m.state = stateResult
 		m.forceKill = false
-		return m, refreshPorts
+		return m, m.refreshPorts
 
-	case "n":
+	case "n", "esc":
 		m.state = stateList
 		m.forceKill = false
 	}
@@ -298,58 +378,56 @@ func (m model) handleResultKey(key string) (tea.Model, tea.Cmd) {
 func (m model) View() string {
 	var b strings.Builder
 
-	b.WriteString(titleStyle.Render("⚡ portk"))
-	b.WriteString("\n")
+	// Title + count
+	title := titleStyle.Render("portk")
+	filterLabel := "dev servers"
+	if m.showAll {
+		filterLabel = "all"
+	}
+	count := countStyle.Render(fmt.Sprintf(" %d ports (%s)", len(m.ports), filterLabel))
+	b.WriteString(title + count + "\n")
+	b.WriteString(separatorStyle.Render(strings.Repeat("─", 50)) + "\n")
 
 	if len(m.ports) == 0 {
-		b.WriteString(emptyStyle.Render("  No listening ports found."))
 		b.WriteString("\n")
-		b.WriteString(helpStyle.Render("  r refresh  q quit"))
+		b.WriteString(emptyStyle.Render("  No listening ports found."))
+		b.WriteString("\n\n")
+		help := "  a show all  r refresh  q quit"
+		b.WriteString(helpStyle.Render(help))
 		return b.String()
 	}
-
-	// Header
-	b.WriteString(headerStyle.Render(fmt.Sprintf("  %-8s %-18s %-10s %s", "PORT", "COMMAND", "PID", "USER")))
-	b.WriteString("\n")
 
 	// Port list
 	for i, p := range m.ports {
 		cursor := "  "
 		if i == m.cursor {
-			cursor = cursorStyle.Render("▸ ")
+			cursor = cursorStyle.Render("› ")
 		}
 
-		pStyle := portStyle
-		if p.Port < 1024 {
-			pStyle = portSystemStyle
-		}
+		portStr := portStyle.Render(fmt.Sprintf(":%-5d", p.Port))
+		cmdStr := commandStyle.Render(fmt.Sprintf("%-15s", truncate(p.Command, 15)))
+		pidStr := pidStyle.Render(fmt.Sprintf("PID %-7d", p.PID))
 
-		portStr := pStyle.Render(fmt.Sprintf(":%-7d", p.Port))
-		cmdStr := commandStyle.Render(fmt.Sprintf("%-18s", truncate(p.Command, 18)))
-		pidStr := pidStyle.Render(fmt.Sprintf("%-10d", p.PID))
-		userStr := userStyle.Render(p.User)
-
-		line := fmt.Sprintf("%s%s %s %s %s", cursor, portStr, cmdStr, pidStr, userStr)
+		line := fmt.Sprintf("%s%s  %s  %s", cursor, portStr, cmdStr, pidStr)
 
 		if i == m.cursor {
-			line = selectedRowStyle.Render(line)
+			line = selectedRowBg.Render(line)
 		}
 
-		b.WriteString(line)
-		b.WriteString("\n")
+		b.WriteString(line + "\n")
 	}
+
+	b.WriteString(separatorStyle.Render(strings.Repeat("─", 50)) + "\n")
 
 	// Confirm dialog
 	if m.state == stateConfirm && m.cursor < len(m.ports) {
 		p := m.ports[m.cursor]
 		action := "Kill"
-		sig := "SIGTERM"
 		if m.forceKill {
 			action = "Force kill"
-			sig = "SIGKILL"
 		}
 		b.WriteString(confirmStyle.Render(
-			fmt.Sprintf("  %s :%d (%s, PID %d) with %s? [y/n]", action, p.Port, p.Command, p.PID, sig),
+			fmt.Sprintf("  %s :%d (%s)? y/n", action, p.Port, p.Command),
 		))
 		b.WriteString("\n")
 	}
@@ -359,18 +437,20 @@ func (m model) View() string {
 		style := successStyle
 		prefix := "  ✓ "
 		if m.messageErr {
-			style = errorStyle
+			style = errorMsgStyle
 			prefix = "  ✗ "
 		}
-		b.WriteString(style.Render(prefix + m.message))
-		b.WriteString("\n")
-		b.WriteString(helpStyle.Render("  Press any key to continue"))
-		b.WriteString("\n")
+		b.WriteString(style.Render(prefix+m.message) + "\n")
+		b.WriteString(helpStyle.Render("  press any key") + "\n")
 	}
 
-	// Help bar
+	// Help
 	if m.state == stateList {
-		b.WriteString(helpStyle.Render("  ↑/↓ navigate  enter kill  K force kill  r refresh  q quit"))
+		allToggle := "a all"
+		if m.showAll {
+			allToggle = "a dev only"
+		}
+		b.WriteString(helpStyle.Render(fmt.Sprintf("  ↑/↓ navigate  enter kill  K force  %s  r refresh  q quit", allToggle)))
 	}
 
 	return b.String()
@@ -383,18 +463,40 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen-1] + "…"
 }
 
-// --- CLI fallback for non-interactive use ---
+// --- CLI mode ---
 
 func main() {
 	args := os.Args[1:]
 
-	// If args given, use CLI mode
 	if len(args) > 0 {
+		showAll := false
+		// Check for --all / -a flag
+		filtered := make([]string, 0, len(args))
+		for _, a := range args {
+			if a == "--all" || a == "-a" {
+				showAll = true
+			} else {
+				filtered = append(filtered, a)
+			}
+		}
+		args = filtered
+
+		if len(args) == 0 {
+			// Just --all flag, launch TUI in all mode
+			m := model{ports: getPorts(true), state: stateList, showAll: true}
+			p := tea.NewProgram(m, tea.WithAltScreen())
+			if _, err := p.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %s\n", err)
+				os.Exit(1)
+			}
+			return
+		}
+
 		switch args[0] {
 		case "-h", "--help", "help":
 			printUsage()
 		case "ls", "list":
-			listPortsCLI()
+			listPortsCLI(showAll)
 		case "kill", "k":
 			if len(args) < 2 {
 				fmt.Fprintf(os.Stderr, "Usage: portk kill <port> [port...]\n")
@@ -425,7 +527,7 @@ func main() {
 		return
 	}
 
-	// Default: TUI mode
+	// Default: TUI mode (dev servers only)
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
@@ -437,20 +539,25 @@ func printUsage() {
 	fmt.Println(`portk - fast port killer
 
 USAGE
-  portk                  Interactive TUI
-  portk ls               List all listening ports
+  portk                  Interactive TUI (dev servers only)
+  portk -a               Interactive TUI (all ports)
+  portk ls               List dev server ports
+  portk ls -a            List all listening ports
   portk kill <port>      Kill process on port (SIGTERM)
-  portk kill! <port>     Force kill process on port (SIGKILL)
+  portk kill! <port>     Force kill (SIGKILL)
   portk <port>           Shorthand for kill
 
-EXAMPLES
-  portk 3000             Kill whatever runs on :3000
-  portk kill 8080 3000   Kill :8080 and :3000
-  portk kill! 5432       Force kill :5432`)
+TUI KEYS
+  ↑/↓ j/k   Navigate
+  enter      Kill (SIGTERM) with confirmation
+  K          Force kill (SIGKILL) with confirmation
+  a          Toggle dev servers / all ports
+  r          Refresh
+  q          Quit`)
 }
 
-func listPortsCLI() {
-	ports := getPorts()
+func listPortsCLI(showAll bool) {
+	ports := getPorts(showAll)
 	if len(ports) == 0 {
 		fmt.Println("No listening ports found")
 		return
@@ -468,7 +575,8 @@ func killPortCLI(portStr string, force bool) {
 		return
 	}
 
-	ports := getPorts()
+	// Kill searches all ports, not just dev
+	ports := getPorts(true)
 	var info *PortInfo
 	for _, p := range ports {
 		if p.Port == port {
