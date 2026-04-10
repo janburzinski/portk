@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -209,7 +210,6 @@ type viewState int
 const (
 	stateList viewState = iota
 	stateConfirm
-	stateResult
 )
 
 type model struct {
@@ -235,8 +235,16 @@ type portsRefreshedMsg struct {
 	ports []PortInfo
 }
 
+type clearMessageMsg struct{}
+
 func (m model) refreshPorts() tea.Msg {
 	return portsRefreshedMsg{ports: getPorts(m.showAll)}
+}
+
+func clearMessageAfter(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(time.Time) tea.Msg {
+		return clearMessageMsg{}
+	})
 }
 
 func (m model) Init() tea.Cmd {
@@ -254,6 +262,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.cursor >= len(m.ports) {
 			m.cursor = max(0, len(m.ports)-1)
 		}
+
+	case clearMessageMsg:
+		m.message = ""
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -276,9 +287,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Quit
 	case "esc":
-		if m.state == stateConfirm || m.state == stateResult {
+		if m.state == stateConfirm {
 			m.state = stateList
-			m.message = ""
 			m.forceKill = false
 			return m, nil
 		}
@@ -290,8 +300,6 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleListKey(key)
 	case stateConfirm:
 		return m.handleConfirmKey(key)
-	case stateResult:
-		return m.handleResultKey(key)
 	}
 
 	return m, nil
@@ -351,27 +359,21 @@ func (m model) handleConfirmKey(key string) (tea.Model, tea.Cmd) {
 
 		err := syscall.Kill(p.PID, sig)
 		if err != nil {
-			m.message = fmt.Sprintf("Failed to kill PID %d: %s", p.PID, err)
+			m.message = fmt.Sprintf("✗ Failed to kill PID %d: %s", p.PID, err)
 			m.messageErr = true
 		} else {
-			m.message = fmt.Sprintf("Killed :%d  %s (PID %d) [%s]", p.Port, p.Command, p.PID, sigName)
+			m.message = fmt.Sprintf("✓ Killed :%d  %s [%s]", p.Port, p.Command, sigName)
 			m.messageErr = false
 		}
-		m.state = stateResult
+		m.state = stateList
 		m.forceKill = false
-		return m, m.refreshPorts
+		return m, tea.Batch(m.refreshPorts, clearMessageAfter(3*time.Second))
 
 	case "n", "esc":
 		m.state = stateList
 		m.forceKill = false
 	}
 
-	return m, nil
-}
-
-func (m model) handleResultKey(key string) (tea.Model, tea.Cmd) {
-	m.state = stateList
-	m.message = ""
 	return m, nil
 }
 
@@ -419,6 +421,15 @@ func (m model) View() string {
 
 	b.WriteString(separatorStyle.Render(strings.Repeat("─", 50)) + "\n")
 
+	// Status message (auto-clears after kill)
+	if m.message != "" {
+		style := successStyle
+		if m.messageErr {
+			style = errorMsgStyle
+		}
+		b.WriteString(style.Render("  "+m.message) + "\n")
+	}
+
 	// Confirm dialog
 	if m.state == stateConfirm && m.cursor < len(m.ports) {
 		p := m.ports[m.cursor]
@@ -430,18 +441,6 @@ func (m model) View() string {
 			fmt.Sprintf("  %s :%d (%s)? y/n", action, p.Port, p.Command),
 		))
 		b.WriteString("\n")
-	}
-
-	// Result message
-	if m.state == stateResult && m.message != "" {
-		style := successStyle
-		prefix := "  ✓ "
-		if m.messageErr {
-			style = errorMsgStyle
-			prefix = "  ✗ "
-		}
-		b.WriteString(style.Render(prefix+m.message) + "\n")
-		b.WriteString(helpStyle.Render("  press any key") + "\n")
 	}
 
 	// Help
