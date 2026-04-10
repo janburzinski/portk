@@ -65,15 +65,16 @@ const (
 )
 
 type model struct {
-	ports      []ports.Info
-	cursor     int
-	state      viewState
-	forceKill  bool
-	showAll    bool
-	message    string
-	messageErr bool
-	width      int
-	height     int
+	ports        []ports.Info
+	cursor       int
+	scrollOffset int
+	state        viewState
+	forceKill    bool
+	showAll      bool
+	message      string
+	messageErr   bool
+	width        int
+	height       int
 }
 
 type portsRefreshedMsg struct {
@@ -109,11 +110,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.ensureCursorVisible()
 	case portsRefreshedMsg:
 		m.ports = msg.ports
 		if m.cursor >= len(m.ports) {
 			m.cursor = max(0, len(m.ports)-1)
 		}
+		m.ensureCursorVisible()
 	case clearMessageMsg:
 		m.message = ""
 	case tea.KeyMsg:
@@ -154,16 +157,26 @@ func (m model) handleListKey(key string) (tea.Model, tea.Cmd) {
 		if m.cursor > 0 {
 			m.cursor--
 		}
+		m.ensureCursorVisible()
 	case "down", "j":
 		if len(m.ports) > 0 && m.cursor < len(m.ports)-1 {
 			m.cursor++
 		}
+		m.ensureCursorVisible()
+	case "pgup", "pageup", "ctrl+u":
+		m.cursor = max(0, m.cursor-m.listHeight())
+		m.ensureCursorVisible()
+	case "pgdown", "pagedown", "ctrl+d":
+		m.cursor = min(max(0, len(m.ports)-1), m.cursor+m.listHeight())
+		m.ensureCursorVisible()
 	case "home", "g":
 		m.cursor = 0
+		m.ensureCursorVisible()
 	case "end", "G":
 		if len(m.ports) > 0 {
 			m.cursor = len(m.ports) - 1
 		}
+		m.ensureCursorVisible()
 	case "enter":
 		if len(m.ports) > 0 {
 			m.state = stateConfirm
@@ -177,6 +190,7 @@ func (m model) handleListKey(key string) (tea.Model, tea.Cmd) {
 	case "a":
 		m.showAll = !m.showAll
 		m.cursor = 0
+		m.scrollOffset = 0
 		return m, m.refreshPorts
 	case "r":
 		return m, m.refreshPorts
@@ -232,7 +246,12 @@ func (m model) View() string {
 		return b.String()
 	}
 
-	for i, p := range m.ports {
+	visibleHeight := m.listHeight()
+	start := min(m.scrollOffset, max(0, len(m.ports)-1))
+	end := min(len(m.ports), start+visibleHeight)
+
+	for i := start; i < end; i++ {
+		p := m.ports[i]
 		cursor := "  "
 		if i == m.cursor {
 			cursor = cursorStyle.Render("› ")
@@ -274,10 +293,64 @@ func (m model) View() string {
 		if m.showAll {
 			allToggle = "a dev only"
 		}
-		b.WriteString(helpStyle.Render(fmt.Sprintf("  ↑/↓ navigate  enter kill  K force  %s  r refresh  q quit", allToggle)))
+		scrollHint := ""
+		if len(m.ports) > visibleHeight {
+			scrollHint = "  pgup/pgdn scroll"
+		}
+		b.WriteString(helpStyle.Render(fmt.Sprintf("  ↑/↓ navigate  enter kill  K force  %s  r refresh%s  q quit", allToggle, scrollHint)))
 	}
 
 	return b.String()
+}
+
+func (m *model) listHeight() int {
+	if len(m.ports) == 0 {
+		return 1
+	}
+	if m.height <= 0 {
+		return len(m.ports)
+	}
+
+	// title + top separator + bottom separator + footer line
+	height := m.height - 4
+	if m.message != "" {
+		height--
+	}
+	if height < 1 {
+		height = 1
+	}
+	return height
+}
+
+func (m *model) ensureCursorVisible() {
+	if len(m.ports) == 0 {
+		m.cursor = 0
+		m.scrollOffset = 0
+		return
+	}
+
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	if m.cursor >= len(m.ports) {
+		m.cursor = len(m.ports) - 1
+	}
+
+	visible := m.listHeight()
+	if m.cursor < m.scrollOffset {
+		m.scrollOffset = m.cursor
+	}
+	if m.cursor >= m.scrollOffset+visible {
+		m.scrollOffset = m.cursor - visible + 1
+	}
+
+	maxOffset := max(0, len(m.ports)-visible)
+	if m.scrollOffset > maxOffset {
+		m.scrollOffset = maxOffset
+	}
+	if m.scrollOffset < 0 {
+		m.scrollOffset = 0
+	}
 }
 
 func truncate(s string, maxLen int) string {

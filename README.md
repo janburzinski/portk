@@ -69,6 +69,7 @@ portk kill! 3000
 ## TUI keybindings
 
 - `↑/↓` or `j/k` — navigate
+- `pgup/pgdn` — fast scroll
 - `enter` — kill selected process (SIGTERM, with confirmation)
 - `K` — force kill selected process (SIGKILL, with confirmation)
 - `a` — toggle dev-only / all processes
