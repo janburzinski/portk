@@ -8,88 +8,77 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"text/tabwriter"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
-const (
-	reset   = "\033[0m"
-	bold    = "\033[1m"
-	dim     = "\033[2m"
-	red     = "\033[31m"
-	green   = "\033[32m"
-	yellow  = "\033[33m"
-	cyan    = "\033[36m"
-	bgRed   = "\033[41m"
-	white   = "\033[97m"
+// --- Styles ---
+
+var (
+	titleStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#FF6B6B")).
+			MarginBottom(1)
+
+	headerStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#666666"))
+
+	portStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#61AFEF")).
+			Bold(true)
+
+	portSystemStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#E5C07B")).
+			Bold(true)
+
+	commandStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#C678DD"))
+
+	pidStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#666666"))
+
+	userStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#666666"))
+
+	cursorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FF6B6B")).
+			Bold(true)
+
+	selectedRowStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color("#2C313A")).
+				Bold(true)
+
+	confirmStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#E06C75")).
+			MarginTop(1)
+
+	successStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#98C379")).
+			MarginTop(1)
+
+	errorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#E06C75")).
+			MarginTop(1)
+
+	helpStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#5C6370")).
+			MarginTop(1)
+
+	emptyStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#5C6370")).
+			Italic(true)
 )
+
+// --- Port scanning ---
 
 type PortInfo struct {
-	Proto   string
 	Port    int
 	PID     int
 	Command string
 	User    string
-}
-
-func main() {
-	args := os.Args[1:]
-
-	if len(args) == 0 {
-		interactive()
-		return
-	}
-
-	switch args[0] {
-	case "-h", "--help", "help":
-		printUsage()
-	case "ls", "list":
-		listPorts()
-	case "kill", "k":
-		if len(args) < 2 {
-			fmt.Fprintf(os.Stderr, "%sUsage: portk kill <port> [port...]%s\n", red, reset)
-			os.Exit(1)
-		}
-		for _, p := range args[1:] {
-			killPort(p, false)
-		}
-	case "kill!", "k!":
-		if len(args) < 2 {
-			fmt.Fprintf(os.Stderr, "%sUsage: portk kill! <port> [port...]%s\n", red, reset)
-			os.Exit(1)
-		}
-		for _, p := range args[1:] {
-			killPort(p, true)
-		}
-	default:
-		// If arg is a number, treat as kill
-		if _, err := strconv.Atoi(args[0]); err == nil {
-			for _, p := range args {
-				killPort(p, false)
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "%sUnknown command: %s%s\n", red, args[0], reset)
-			printUsage()
-			os.Exit(1)
-		}
-	}
-}
-
-func printUsage() {
-	fmt.Printf(`%sportk%s - fast port killer
-
-%sUSAGE%s
-  portk                  Interactive mode
-  portk ls               List all listening ports
-  portk kill <port>      Kill process on port (SIGTERM)
-  portk kill! <port>     Force kill process on port (SIGKILL)
-  portk <port>           Shorthand for kill
-  portk <port> <port>    Kill multiple ports
-
-%sEXAMPLES%s
-  portk 3000             Kill whatever runs on :3000
-  portk kill 8080 3000   Kill :8080 and :3000
-  portk kill! 5432       Force kill :5432
-`, bold, reset, dim, reset, dim, reset)
 }
 
 func getPorts() []PortInfo {
@@ -115,7 +104,6 @@ func getPorts() []PortInfo {
 		user := fields[2]
 		name := fields[8]
 
-		// Parse port from "host:port" or "*:port"
 		idx := strings.LastIndex(name, ":")
 		if idx == -1 {
 			continue
@@ -131,7 +119,6 @@ func getPorts() []PortInfo {
 		seen[port] = true
 
 		ports = append(ports, PortInfo{
-			Proto:   "TCP",
 			Port:    port,
 			PID:     pid,
 			Command: command,
@@ -142,50 +129,356 @@ func getPorts() []PortInfo {
 	return ports
 }
 
-func listPorts() {
-	ports := getPorts()
-	if len(ports) == 0 {
-		fmt.Printf("%sNo listening ports found%s\n", dim, reset)
-		return
-	}
+// --- TUI Model ---
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(w, "%s%sPORT\tPID\tCOMMAND\tUSER%s\n", bold, dim, reset)
-	for _, p := range ports {
-		portColor := cyan
-		if p.Port < 1024 {
-			portColor = yellow
-		}
-		fmt.Fprintf(w, "%s:%d%s\t%d\t%s%s%s\t%s\n",
-			portColor, p.Port, reset,
-			p.PID,
-			bold, p.Command, reset,
-			p.User,
-		)
-	}
-	w.Flush()
+type state int
+
+const (
+	stateList state = iota
+	stateConfirm
+	stateResult
+)
+
+type model struct {
+	ports      []PortInfo
+	cursor     int
+	state      state
+	forceKill  bool
+	message    string
+	messageErr bool
+	width      int
+	height     int
 }
 
-func findByPort(port int) *PortInfo {
-	ports := getPorts()
-	for _, p := range ports {
-		if p.Port == port {
-			return &p
-		}
+func initialModel() model {
+	return model{
+		ports: getPorts(),
+		state: stateList,
 	}
+}
+
+type portsRefreshedMsg struct {
+	ports []PortInfo
+}
+
+func refreshPorts() tea.Msg {
+	return portsRefreshedMsg{ports: getPorts()}
+}
+
+func (m model) Init() tea.Cmd {
 	return nil
 }
 
-func killPort(portStr string, force bool) {
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s'%s' is not a valid port%s\n", red, portStr, reset)
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+
+	case portsRefreshedMsg:
+		m.ports = msg.ports
+		if m.cursor >= len(m.ports) {
+			m.cursor = max(0, len(m.ports)-1)
+		}
+
+	case tea.KeyMsg:
+		return m.handleKey(msg)
+	}
+
+	return m, nil
+}
+
+func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+
+	// Global keys
+	switch key {
+	case "ctrl+c", "q":
+		if m.state == stateConfirm {
+			m.state = stateList
+			m.forceKill = false
+			return m, nil
+		}
+		return m, tea.Quit
+	case "esc":
+		if m.state == stateConfirm || m.state == stateResult {
+			m.state = stateList
+			m.message = ""
+			m.forceKill = false
+			return m, nil
+		}
+		return m, tea.Quit
+	}
+
+	switch m.state {
+	case stateList:
+		return m.handleListKey(key)
+	case stateConfirm:
+		return m.handleConfirmKey(key)
+	case stateResult:
+		return m.handleResultKey(key)
+	}
+
+	return m, nil
+}
+
+func (m model) handleListKey(key string) (tea.Model, tea.Cmd) {
+	if len(m.ports) == 0 {
+		if key == "r" {
+			return m, refreshPorts
+		}
+		return m, nil
+	}
+
+	switch key {
+	case "up", "k":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+	case "down", "j":
+		if m.cursor < len(m.ports)-1 {
+			m.cursor++
+		}
+	case "home", "g":
+		m.cursor = 0
+	case "end", "G":
+		m.cursor = len(m.ports) - 1
+	case "K":
+		// Force kill — confirm with SIGKILL
+		m.state = stateConfirm
+		m.forceKill = true
+	case "enter":
+		// Kill — confirm with SIGTERM
+		m.state = stateConfirm
+		m.forceKill = false
+	case "r":
+		return m, refreshPorts
+	}
+
+	return m, nil
+}
+
+func (m model) handleConfirmKey(key string) (tea.Model, tea.Cmd) {
+	switch key {
+	case "y", "enter":
+		p := m.ports[m.cursor]
+		sig := syscall.SIGTERM
+		sigName := "SIGTERM"
+		if m.forceKill {
+			sig = syscall.SIGKILL
+			sigName = "SIGKILL"
+		}
+
+		err := syscall.Kill(p.PID, sig)
+		if err != nil {
+			m.message = fmt.Sprintf("Failed to kill PID %d: %s", p.PID, err)
+			m.messageErr = true
+		} else {
+			m.message = fmt.Sprintf("Killed :%d (%s, PID %d) [%s]", p.Port, p.Command, p.PID, sigName)
+			m.messageErr = false
+		}
+		m.state = stateResult
+		m.forceKill = false
+		return m, refreshPorts
+
+	case "n":
+		m.state = stateList
+		m.forceKill = false
+	}
+
+	return m, nil
+}
+
+func (m model) handleResultKey(key string) (tea.Model, tea.Cmd) {
+	m.state = stateList
+	m.message = ""
+	return m, nil
+}
+
+func (m model) View() string {
+	var b strings.Builder
+
+	b.WriteString(titleStyle.Render("⚡ portk"))
+	b.WriteString("\n")
+
+	if len(m.ports) == 0 {
+		b.WriteString(emptyStyle.Render("  No listening ports found."))
+		b.WriteString("\n")
+		b.WriteString(helpStyle.Render("  r refresh  q quit"))
+		return b.String()
+	}
+
+	// Header
+	b.WriteString(headerStyle.Render(fmt.Sprintf("  %-8s %-18s %-10s %s", "PORT", "COMMAND", "PID", "USER")))
+	b.WriteString("\n")
+
+	// Port list
+	for i, p := range m.ports {
+		cursor := "  "
+		if i == m.cursor {
+			cursor = cursorStyle.Render("▸ ")
+		}
+
+		pStyle := portStyle
+		if p.Port < 1024 {
+			pStyle = portSystemStyle
+		}
+
+		portStr := pStyle.Render(fmt.Sprintf(":%-7d", p.Port))
+		cmdStr := commandStyle.Render(fmt.Sprintf("%-18s", truncate(p.Command, 18)))
+		pidStr := pidStyle.Render(fmt.Sprintf("%-10d", p.PID))
+		userStr := userStyle.Render(p.User)
+
+		line := fmt.Sprintf("%s%s %s %s %s", cursor, portStr, cmdStr, pidStr, userStr)
+
+		if i == m.cursor {
+			line = selectedRowStyle.Render(line)
+		}
+
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+
+	// Confirm dialog
+	if m.state == stateConfirm && m.cursor < len(m.ports) {
+		p := m.ports[m.cursor]
+		action := "Kill"
+		sig := "SIGTERM"
+		if m.forceKill {
+			action = "Force kill"
+			sig = "SIGKILL"
+		}
+		b.WriteString(confirmStyle.Render(
+			fmt.Sprintf("  %s :%d (%s, PID %d) with %s? [y/n]", action, p.Port, p.Command, p.PID, sig),
+		))
+		b.WriteString("\n")
+	}
+
+	// Result message
+	if m.state == stateResult && m.message != "" {
+		style := successStyle
+		prefix := "  ✓ "
+		if m.messageErr {
+			style = errorStyle
+			prefix = "  ✗ "
+		}
+		b.WriteString(style.Render(prefix + m.message))
+		b.WriteString("\n")
+		b.WriteString(helpStyle.Render("  Press any key to continue"))
+		b.WriteString("\n")
+	}
+
+	// Help bar
+	if m.state == stateList {
+		b.WriteString(helpStyle.Render("  ↑/↓ navigate  enter kill  K force kill  r refresh  q quit"))
+	}
+
+	return b.String()
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-1] + "…"
+}
+
+// --- CLI fallback for non-interactive use ---
+
+func main() {
+	args := os.Args[1:]
+
+	// If args given, use CLI mode
+	if len(args) > 0 {
+		switch args[0] {
+		case "-h", "--help", "help":
+			printUsage()
+		case "ls", "list":
+			listPortsCLI()
+		case "kill", "k":
+			if len(args) < 2 {
+				fmt.Fprintf(os.Stderr, "Usage: portk kill <port> [port...]\n")
+				os.Exit(1)
+			}
+			for _, p := range args[1:] {
+				killPortCLI(p, false)
+			}
+		case "kill!", "k!":
+			if len(args) < 2 {
+				fmt.Fprintf(os.Stderr, "Usage: portk kill! <port> [port...]\n")
+				os.Exit(1)
+			}
+			for _, p := range args[1:] {
+				killPortCLI(p, true)
+			}
+		default:
+			if _, err := strconv.Atoi(args[0]); err == nil {
+				for _, p := range args {
+					killPortCLI(p, false)
+				}
+			} else {
+				fmt.Fprintf(os.Stderr, "Unknown command: %s\n", args[0])
+				printUsage()
+				os.Exit(1)
+			}
+		}
 		return
 	}
 
-	info := findByPort(port)
+	// Default: TUI mode
+	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
+		os.Exit(1)
+	}
+}
+
+func printUsage() {
+	fmt.Println(`portk - fast port killer
+
+USAGE
+  portk                  Interactive TUI
+  portk ls               List all listening ports
+  portk kill <port>      Kill process on port (SIGTERM)
+  portk kill! <port>     Force kill process on port (SIGKILL)
+  portk <port>           Shorthand for kill
+
+EXAMPLES
+  portk 3000             Kill whatever runs on :3000
+  portk kill 8080 3000   Kill :8080 and :3000
+  portk kill! 5432       Force kill :5432`)
+}
+
+func listPortsCLI() {
+	ports := getPorts()
+	if len(ports) == 0 {
+		fmt.Println("No listening ports found")
+		return
+	}
+	fmt.Printf("%-8s %-18s %-10s %s\n", "PORT", "COMMAND", "PID", "USER")
+	for _, p := range ports {
+		fmt.Printf(":%-7d %-18s %-10d %s\n", p.Port, p.Command, p.PID, p.User)
+	}
+}
+
+func killPortCLI(portStr string, force bool) {
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "'%s' is not a valid port\n", portStr)
+		return
+	}
+
+	ports := getPorts()
+	var info *PortInfo
+	for _, p := range ports {
+		if p.Port == port {
+			info = &p
+			break
+		}
+	}
+
 	if info == nil {
-		fmt.Printf("%s:%d%s — %snothing listening%s\n", dim, port, reset, dim, reset)
+		fmt.Printf(":%d — nothing listening\n", port)
 		return
 	}
 
@@ -198,140 +491,9 @@ func killPort(portStr string, force bool) {
 
 	err = syscall.Kill(info.PID, sig)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%sFailed to kill PID %d on :%d — %s%s\n", red, info.PID, port, err, reset)
+		fmt.Fprintf(os.Stderr, "Failed to kill PID %d on :%d — %s\n", info.PID, port, err)
 		return
 	}
 
-	fmt.Printf("%s%s ✕ :%d%s — killed %s%s%s (PID %d) [%s]\n",
-		bgRed, white, port, reset,
-		bold, info.Command, reset,
-		info.PID, sigName,
-	)
-}
-
-func interactive() {
-	ports := getPorts()
-	if len(ports) == 0 {
-		fmt.Printf("%sNo listening ports found%s\n", dim, reset)
-		return
-	}
-
-	fmt.Printf("%s%sportk%s — interactive mode (q to quit)\n\n", bold, cyan, reset)
-	printNumberedPorts(ports)
-
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		fmt.Printf("\n%s❯%s ", green, reset)
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
-
-		if input == "" {
-			continue
-		}
-		if input == "q" || input == "quit" || input == "exit" {
-			return
-		}
-		if input == "r" || input == "refresh" {
-			ports = getPorts()
-			if len(ports) == 0 {
-				fmt.Printf("%sNo listening ports found%s\n", dim, reset)
-				return
-			}
-			printNumberedPorts(ports)
-			continue
-		}
-		if input == "?" || input == "help" {
-			fmt.Printf("  %s#%s      Kill by list number\n", dim, reset)
-			fmt.Printf("  %s:port%s  Kill by port number\n", dim, reset)
-			fmt.Printf("  %sr%s     Refresh list\n", dim, reset)
-			fmt.Printf("  %sq%s     Quit\n", dim, reset)
-			continue
-		}
-
-		// Handle "all" — kill everything
-		if input == "all" {
-			for _, p := range ports {
-				killByInfo(p, false)
-			}
-			ports = getPorts()
-			if len(ports) == 0 {
-				fmt.Printf("\n%sAll ports cleared%s\n", green, reset)
-				return
-			}
-			printNumberedPorts(ports)
-			continue
-		}
-
-		// Check if input starts with "!" for force kill
-		force := false
-		cleanInput := input
-		if strings.HasSuffix(input, "!") {
-			force = true
-			cleanInput = strings.TrimSuffix(input, "!")
-		}
-
-		// Try as list index
-		if idx, err := strconv.Atoi(cleanInput); err == nil {
-			if idx >= 1 && idx <= len(ports) {
-				killByInfo(ports[idx-1], force)
-				ports = getPorts()
-				if len(ports) == 0 {
-					fmt.Printf("\n%sAll ports cleared%s\n", green, reset)
-					return
-				}
-				printNumberedPorts(ports)
-				continue
-			}
-			// Treat as port number
-			killPort(cleanInput, force)
-			ports = getPorts()
-			if len(ports) == 0 {
-				fmt.Printf("\n%sAll ports cleared%s\n", green, reset)
-				return
-			}
-			printNumberedPorts(ports)
-			continue
-		}
-
-		fmt.Printf("%sUnknown input. Type ? for help%s\n", dim, reset)
-	}
-}
-
-func printNumberedPorts(ports []PortInfo) {
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	for i, p := range ports {
-		portColor := cyan
-		if p.Port < 1024 {
-			portColor = yellow
-		}
-		fmt.Fprintf(w, "  %s%d)%s\t%s:%d%s\t%s%s%s\t%sPID %d%s\t%s\n",
-			dim, i+1, reset,
-			portColor, p.Port, reset,
-			bold, p.Command, reset,
-			dim, p.PID, reset,
-			p.User,
-		)
-	}
-	w.Flush()
-}
-
-func killByInfo(info PortInfo, force bool) {
-	sig := syscall.SIGTERM
-	sigName := "SIGTERM"
-	if force {
-		sig = syscall.SIGKILL
-		sigName = "SIGKILL"
-	}
-
-	err := syscall.Kill(info.PID, sig)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%sFailed to kill PID %d on :%d — %s%s\n", red, info.PID, info.Port, err, reset)
-		return
-	}
-
-	fmt.Printf("  %s%s ✕ :%d%s — killed %s%s%s (PID %d) [%s]\n",
-		bgRed, white, info.Port, reset,
-		bold, info.Command, reset,
-		info.PID, sigName,
-	)
+	fmt.Printf("✕ :%d — killed %s (PID %d) [%s]\n", port, info.Command, info.PID, sigName)
 }
